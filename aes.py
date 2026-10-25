@@ -1,3 +1,5 @@
+import os
+
 ## FIPS-197: https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197-upd1.pdf
 
 SBOX = (
@@ -62,11 +64,12 @@ def expand_key(key: bytes) -> list:
             temp = [SBOX[b] for b in temp[1:] + temp[:1]]  # SubWord(RotWord)
             temp[0] ^= RCON[i // nk - 1]
         elif nk > 6 and i % nk == 4:
-            temp = [SBOX[b] for b in temp]  # extra SubWord AES-256
+            temp = [SBOX[b] for b in temp]  # extra SubWord for AES-256
         words.append([a ^ b for a, b in zip(words[i - nk], temp)])
     return [sum(words[r * 4:r * 4 + 4], []) for r in range(nr + 1)]
 
-# State 16 bytes column - state[col * 4 + row]
+# State = 16 bytes
+# Column order - state[col * 4 + row]
 def sub_bytes(state: list, box: tuple) -> list:
     return [box[b] for b in state]
 
@@ -90,7 +93,7 @@ def mix_columns(state: list, matrix: tuple) -> list:
 def add_round_key(state: list, round_key: list) -> list:
     return [a ^ b for a, b in zip(state, round_key)]
 
-# AES block (16-byte input + round keys = 16-byte output)
+# AES block encryption/decryption (16-byte input + round keys = 16-byte output)
 def encrypt_block(block: bytes, round_keys: list) -> bytes:
     state = add_round_key(list(block), round_keys[0])
     for round_key in round_keys[1:-1]:
@@ -106,3 +109,43 @@ def decrypt_block(block: bytes, round_keys: list) -> bytes:
         state = mix_columns(add_round_key(state, round_key), INV_MIX)
     state = add_round_key(sub_bytes(inv_shift_rows(state), INV_SBOX), round_keys[0])
     return bytes(state)
+
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+# Encrypt Decrypt (Hexstring E(K, IV-ecb mode) + Ciphertext - ASCII Message), AES-CBC + PKCS#7
+def encrypt(text: str, key: str) -> str:
+    round_keys = expand_key(check_key(key))
+    try:
+        data = text.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("plaintext must be ASCII") from None
+    pad = BLOCK - len(data) % BLOCK
+    data += bytes([pad]) * pad
+
+    iv = os.urandom(BLOCK)
+    previous, result = iv, encrypt_block(iv, round_keys)
+    for i in range(0, len(data), BLOCK):
+        previous = encrypt_block(xor_bytes(data[i:i + BLOCK], previous), round_keys)
+        result += previous
+    return result.hex()
+
+def decrypt(cipher_hex: str, key: str) -> str:
+    round_keys = expand_key(check_key(key))
+    data = bytes.fromhex(cipher_hex)
+    if len(data) < 2 * BLOCK or len(data) % BLOCK:
+        raise ValueError("invalid ciphertext length")
+
+    previous, result = decrypt_block(data[:BLOCK], round_keys), b""
+    for i in range(BLOCK, len(data), BLOCK):
+        block = data[i:i + BLOCK]
+        result += xor_bytes(decrypt_block(block, round_keys), previous)
+        previous = block
+
+    pad = result[-1]
+    if not 1 <= pad <= BLOCK or result[-pad:] != bytes([pad]) * pad:
+        raise ValueError("wrong key or corrupted message")
+    try:
+        return result[:-pad].decode("ascii")
+    except UnicodeDecodeError:
+        raise ValueError("wrong key or corrupted message") from None
